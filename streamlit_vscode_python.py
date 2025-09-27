@@ -1,0 +1,438 @@
+# bankrup.py
+import streamlit as st
+import numpy as np
+import pandas as pd
+import joblib
+import os
+import math
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score,
+    confusion_matrix, classification_report, roc_curve, auc
+)
+from tensorflow.keras.models import load_model
+from functools import lru_cache
+
+st.set_page_config(
+    page_title="🏦 Bankruptcy Prediction App",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ------------------------
+# Utility: engineered features (based on your earlier function)
+# ------------------------
+def make_features(industrial_risk, management_risk, financial_flexibility,
+                  credibility, competitiveness, operating_risk):
+    """Return a DataFrame with 56 engineered features (same order used when training)."""
+    total_risk = industrial_risk + management_risk + financial_flexibility + credibility + competitiveness + operating_risk
+    flexibility_vs_risk = financial_flexibility / (industrial_risk + 1e-9)
+    indus_op_risk = industrial_risk * operating_risk
+    manage_finflex = management_risk * financial_flexibility
+
+    features = {
+        'financial_flexibility^2': financial_flexibility ** 2,
+        'total_risk': total_risk,
+        'flexibility_vs_risk': flexibility_vs_risk,
+        'credibility^2': credibility ** 2,
+        'management_risk': management_risk,
+        'financial_flexibility flexibility_vs_risk': financial_flexibility * flexibility_vs_risk,
+        'credibility competitiveness': credibility * competitiveness,
+        'competitiveness total_risk': competitiveness * total_risk,
+        'credibility': credibility,
+        'flex_vs_comp': flexibility_vs_risk * competitiveness,
+        'operating_risk': operating_risk,
+        'competitiveness flexibility_vs_risk': competitiveness * flexibility_vs_risk,
+        'competitiveness^2': competitiveness ** 2,
+        'industrial_risk': industrial_risk,
+        'credibility flexibility_vs_risk': credibility * flexibility_vs_risk,
+        'flexibility_vs_risk^2': flexibility_vs_risk ** 2,
+        'cred_comp': credibility * competitiveness,
+        'competitiveness': competitiveness,
+        'financial_flexibility': financial_flexibility,
+        'financial_flexibility competitiveness': financial_flexibility * competitiveness,
+        'industrial_risk^2': industrial_risk ** 2,
+        'industrial_risk management_risk': industrial_risk * management_risk,
+        'industrial_risk financial_flexibility': industrial_risk * financial_flexibility,
+        'industrial_risk credibility': industrial_risk * credibility,
+        'industrial_risk competitiveness': industrial_risk * competitiveness,
+        'industrial_risk operating_risk': industrial_risk * operating_risk,
+        'industrial_risk total_risk': industrial_risk * total_risk,
+        'industrial_risk flexibility_vs_risk': industrial_risk * flexibility_vs_risk,
+        'industrial_risk indus_op_risk': indus_op_risk,
+        'industrial_risk manage_finflex': manage_finflex,
+        'management_risk^2': management_risk ** 2,
+        'management_risk financial_flexibility': management_risk * financial_flexibility,
+        'management_risk credibility': management_risk * credibility,
+        'management_risk competitiveness': management_risk * competitiveness,
+        'management_risk operating_risk': management_risk * operating_risk,
+        'management_risk total_risk': management_risk * total_risk,
+        'management_risk flexibility_vs_risk': management_risk * flexibility_vs_risk,
+        'management_risk indus_op_risk': management_risk * indus_op_risk,
+        'management_risk manage_finflex': management_risk * manage_finflex,
+        'financial_flexibility credibility': financial_flexibility * credibility,
+        'financial_flexibility operating_risk': financial_flexibility * operating_risk,
+        'financial_flexibility total_risk': financial_flexibility * total_risk,
+        'financial_flexibility indus_op_risk': financial_flexibility * indus_op_risk,
+        'financial_flexibility manage_finflex': financial_flexibility * manage_finflex,
+        'credibility operating_risk': credibility * operating_risk,
+        'credibility total_risk': credibility * total_risk,
+        'credibility indus_op_risk': credibility * indus_op_risk,
+        'credibility manage_finflex': credibility * manage_finflex,
+        'competitiveness operating_risk': competitiveness * operating_risk,
+        'competitiveness indus_op_risk': competitiveness * indus_op_risk,
+        'competitiveness manage_finflex': competitiveness * manage_finflex,
+        'operating_risk^2': operating_risk ** 2,
+        'operating_risk total_risk': operating_risk * total_risk,
+        'operating_risk flexibility_vs_risk': operating_risk * flexibility_vs_risk,
+        'operating_risk indus_op_risk': operating_risk * indus_op_risk,
+        'operating_risk manage_finflex': operating_risk * manage_finflex,
+    }
+
+    # Ensure deterministic column order: the same order should be used while training.
+    # Provide a stable column list (I use insertion order above).
+    df = pd.DataFrame([features])
+    return df
+
+# ------------------------
+# Model files & leaderboard weights (use your final names)
+# ------------------------
+MODEL_FILES = {
+    "model_1": "model_1.pkl",
+    "model_2": "model_2.pkl",
+    "model_3": "model_3.pkl",
+    "model_4": "model_4.pkl",
+    "model_5": "model5.pkl",
+    "model_6": "model6.pkl",
+    "model_7": "model7.pkl",
+    "model_8": "model8_xgb.pkl",
+    "model_9": "model9_ann",   # directory (keras SavedModel)
+}
+
+# Use leaderboard ROC-AUC or the values you provided as weights
+LEADERBOARD_WEIGHTS = {
+    "model_1": 0.9960,
+    "model_2": 1.0000,
+    "model_3": 0.9960,
+    "model_4": 0.9960,
+    "model_5": 1.0000,
+    "model_6": 0.9960,
+    "model_7": 1.0000,
+    "model_8": 0.9960,
+    "model_9": 0.9960,
+}
+
+TOTAL_WEIGHT = sum(LEADERBOARD_WEIGHTS.values())
+
+# ------------------------
+# Cached loader
+# ------------------------
+@st.cache_resource(show_spinner=False)
+def load_model_safe(model_path):
+    """Load model robustly: joblib.load for sklearn-like, keras.load_model for directories."""
+    # If model_path points to a directory, try keras load
+    if os.path.isdir(model_path):
+        try:
+            m = load_model(model_path)
+            return ("keras", m)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Keras model at {model_path}: {e}")
+    # Otherwise try joblib first, then keras fallback
+    if os.path.exists(model_path):
+        try:
+            m = joblib.load(model_path)
+            return ("joblib", m)
+        except Exception:
+            # Try Keras if joblib fails (sometimes Keras was saved oddly)
+            try:
+                m = load_model(model_path)
+                return ("keras", m)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load model at {model_path} (joblib and keras failed): {e}")
+    raise FileNotFoundError(f"Model file not found: {model_path}")
+
+# ------------------------
+# Load all models (but don't fail if missing)
+# ------------------------
+def load_all_models():
+    loaded = {}
+    missing = []
+    errors = {}
+    for name, path in MODEL_FILES.items():
+        try:
+            typ, m = load_model_safe(path)
+            loaded[name] = (typ, m)
+        except FileNotFoundError:
+            missing.append(name)
+        except Exception as e:
+            errors[name] = str(e)
+    return loaded, missing, errors
+
+# ------------------------
+# Predict (single-row) using a loaded model object
+# ------------------------
+def predict_single_model(model_obj_tuple, X_array):
+    typ, model = model_obj_tuple
+    # Keras
+    if typ == "keras":
+        # model.predict expects 2D array
+        proba = model.predict(X_array, verbose=0).ravel()
+        # If Keras returns shape (n,1) or (n,), above ravel works
+        return proba
+    # joblib / scikit-learn style
+    else:
+        m = model
+        # Some scikit-learn pipelines might require DataFrame with columns: but we'll try numpy array
+        if hasattr(m, "predict_proba"):
+            return m.predict_proba(X_array)[:, 1]
+        elif hasattr(m, "decision_function"):
+            # map decision function to probability-ish using logistic
+            try:
+                df = m.decision_function(X_array)
+                # convert to [0,1] with sigmoid
+                proba = 1 / (1 + np.exp(-df))
+                return proba
+            except Exception:
+                raise RuntimeError("Model has decision_function but conversion failed.")
+        else:
+            # fallback: predict -> 0/1
+            preds = m.predict(X_array)
+            return np.array(preds, dtype=float)  # treat 0/1 as probabilities
+
+# ------------------------
+# UI: Sidebar
+# ------------------------
+st.sidebar.title("App Controls")
+st.sidebar.markdown("**Model files** will be loaded from working directory. Missing files will be skipped.")
+st.sidebar.markdown("You can change the ensemble threshold and preview engineered features.")
+
+ensemble_threshold = st.sidebar.slider("Ensemble decision threshold", 0.0, 1.0, 0.5, 0.01)
+show_individual = st.sidebar.checkbox("Show individual model probabilities", True)
+show_engineered_preview = st.sidebar.checkbox("Show engineered features preview", True)
+run_evaluation = st.sidebar.checkbox("Run evaluation on `filtered_df` if available", False)
+download_predictions = st.sidebar.checkbox("Save ensemble predictions to CSV after predict", True)
+
+# ------------------------
+# UI: Main - Inputs
+# ------------------------
+st.title("🏦 Bankruptcy Prediction — Ensemble (Weighted soft-voting)")
+st.write("Enter the 6 base risk factors (0.0 - 1.0). Engineered features are computed automatically.")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    industrial_risk = st.number_input("Industrial Risk", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+    management_risk = st.number_input("Management Risk", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+with col2:
+    financial_flexibility = st.number_input("Financial Flexibility", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+    credibility = st.number_input("Credibility", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+with col3:
+    competitiveness = st.number_input("Competitiveness", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+    operating_risk = st.number_input("Operating Risk", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+
+preset = st.selectbox("Quick presets", ["Custom", "All low (0.1)", "All mid (0.5)", "All high (0.9)", "Example: stressed company"])
+if preset == "All low (0.1)":
+    industrial_risk = management_risk = financial_flexibility = credibility = competitiveness = operating_risk = 0.1
+elif preset == "All mid (0.5)":
+    industrial_risk = management_risk = financial_flexibility = credibility = competitiveness = operating_risk = 0.5
+elif preset == "All high (0.9)":
+    industrial_risk = management_risk = financial_flexibility = credibility = competitiveness = operating_risk = 0.9
+elif preset == "Example: stressed company":
+    industrial_risk = 0.8; management_risk = 0.75; financial_flexibility = 0.2
+    credibility = 0.3; competitiveness = 0.4; operating_risk = 0.85
+
+# Engineered features preview
+if show_engineered_preview:
+    df_feat = make_features(industrial_risk, management_risk, financial_flexibility,
+                            credibility, competitiveness, operating_risk)
+    st.subheader("🔧 Engineered Features Preview")
+    st.dataframe(df_feat.T.rename(columns={0: "value"}), height=400)
+
+# ------------------------
+# Load models when user clicks predict (so app starts fast)
+# ------------------------
+if st.button("Predict Bankruptcy Risk (Ensemble)"):
+    # build features
+    X_engineered = make_features(industrial_risk, management_risk, financial_flexibility,
+                                 credibility, competitiveness, operating_risk)
+    # ensure shape (1, N)
+    X_array = X_engineered.values
+
+    # load models
+    with st.spinner("Loading models..."):
+        loaded_models, missing, load_errors = load_all_models()
+
+    if missing:
+        st.warning(f"Missing model files (these will be skipped): {missing}")
+    if load_errors:
+        st.error(f"Errors loading some models (see details): {load_errors}")
+
+    # Predict with each available model
+    model_probs = {}
+    raw_sum = np.zeros_like(np.zeros(1), dtype=float)  # single row
+    used_weight_sum = 0.0
+
+    for name, (typ_model) in loaded_models.items():
+        # loaded_models value is (typ, model)
+        try:
+            typ, m = typ_model
+            proba = predict_single_model((typ, m), X_array)  # returns array-like
+            if isinstance(proba, np.ndarray):
+                proba_val = float(np.ravel(proba)[0])
+            else:
+                proba_val = float(proba)
+        except Exception as e:
+            st.error(f"Prediction failed for {name}: {e}")
+            continue
+
+        weight = LEADERBOARD_WEIGHTS.get(name, 1.0)
+        model_probs[name] = (proba_val, weight)
+        raw_sum += proba_val * weight
+        used_weight_sum += weight
+
+    if used_weight_sum == 0:
+        st.error("No models could be used for prediction. Check saved model files and paths.")
+    else:
+        ensemble_prob = float(raw_sum / used_weight_sum)
+        ensemble_pred = int(ensemble_prob >= ensemble_threshold)
+
+        # show results
+        st.subheader("🔮 Prediction (Weighted Soft-Voting Ensemble)")
+        colA, colB = st.columns([2, 3])
+        with colA:
+            st.metric("Ensemble probability", f"{ensemble_prob*100:.2f}%", delta=None)
+            st.metric("Predicted class", "Bankrupt" if ensemble_pred == 1 else "Not Bankrupt")
+            st.write(f"Decision threshold: **{ensemble_threshold:.2f}**")
+
+            if download_predictions:
+                # prepare download CSV
+                out_df = X_engineered.copy()
+                out_df['ensemble_prob'] = ensemble_prob
+                out_df['ensemble_pred'] = ensemble_pred
+                csv = out_df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download prediction CSV", csv, file_name="ensemble_prediction.csv", mime="text/csv")
+        with colB:
+            # per-model bars
+            names = []
+            probs = []
+            weights_plot = []
+            for k, (p, w) in model_probs.items():
+                names.append(k)
+                probs.append(p)
+                weights_plot.append(w)
+            if len(names) > 0:
+                fig, ax = plt.subplots(figsize=(8, 3 + 0.25*len(names)))
+                bars = ax.barh(names, probs, height=0.6)
+                ax.set_xlim(0, 1)
+                ax.set_xlabel("Probability (class=1)")
+                ax.set_title("Per-model Probability (and weights in parentheses)")
+                for i, b in enumerate(bars):
+                    ax.text(b.get_width() + 0.01, b.get_y() + b.get_height()/2,
+                            f"{probs[i]:.3f}  (w={weights_plot[i]:.3f})", va='center')
+                st.pyplot(fig)
+            else:
+                st.info("No individual model probabilities to show.")
+
+        # Optional: if filtered_df exists and user asked for evaluation, compute metrics using true labels
+        if run_evaluation and 'filtered_df' in globals():
+            try:
+                st.subheader("📊 Quick evaluation on `filtered_df` (models predictions vs true)")
+                # use the same engineered features in filtered_df (assume filtered_df already contains the engineered features)
+                df = globals()['filtered_df'].copy()
+                # If df has 'class' and the engineered features in same order, use it; else warn
+                if 'class' not in df.columns:
+                    st.warning("`filtered_df` found but no 'class' column.")
+                else:
+                    X_val = None
+                    # try to select columns matching the X_engineered
+                    needed_cols = list(X_engineered.columns)
+                    missing_cols = [c for c in needed_cols if c not in df.columns]
+                    if missing_cols:
+                        st.warning("filtered_df does not have all engineered columns used by model. Attempting to recompute from base features (if available).")
+                        # if base features exist in filtered_df, recompute engineered features
+                        base_cols = {'industrial_risk','management_risk','financial_flexibility','credibility','competitiveness','operating_risk'}
+                        if base_cols.issubset(set(df.columns)):
+                            # regenerate engineered features for every row
+                            ef_list = []
+                            for _, row in df.iterrows():
+                                ef_list.append(make_features(row['industrial_risk'], row['management_risk'],
+                                                             row['financial_flexibility'], row['credibility'],
+                                                             row['competitiveness'], row['operating_risk']).iloc[0].to_dict())
+                            X_val = pd.DataFrame(ef_list)[needed_cols]
+                        else:
+                            st.error("Cannot evaluate: filtered_df lacks required engineered AND base columns.")
+                    else:
+                        X_val = df[needed_cols].copy()
+
+                    if X_val is not None:
+                        y_true = df['class'].values
+                        # predict ensemble across the dataset
+                        probs_list = np.zeros(len(X_val), dtype=float)
+                        used_weights = 0.0
+                        for name, (typ, mdl) in loaded_models.items():
+                            try:
+                                proba_vec = predict_single_model((typ, mdl), X_val.values)
+                                w = LEADERBOARD_WEIGHTS.get(name, 1.0)
+                                probs_list += np.ravel(proba_vec) * w
+                                used_weights += w
+                            except Exception as e:
+                                st.warning(f"Skipping {name} in evaluation due to error: {e}")
+                        if used_weights == 0.0:
+                            st.error("No models available for evaluation.")
+                        else:
+                            ensemble_probs_val = probs_list / used_weights
+                            ensemble_preds_val = (ensemble_probs_val >= ensemble_threshold).astype(int)
+                            acc = accuracy_score(y_true, ensemble_preds_val)
+                            f1 = f1_score(y_true, ensemble_preds_val)
+                            try:
+                                roc_auc = roc_auc_score(y_true, ensemble_probs_val)
+                            except Exception:
+                                roc_auc = float('nan')
+                            st.write(f"**Ensemble metrics on filtered_df:**  Accuracy={acc:.4f}, F1={f1:.4f}, ROC-AUC={roc_auc:.4f}")
+
+                            # Confusion matrix plot
+                            cm = confusion_matrix(y_true, ensemble_preds_val)
+                            fig, ax = plt.subplots(figsize=(4,4))
+                            im = ax.imshow(cm, cmap='Blues')
+                            ax.set_xticks([0,1]); ax.set_yticks([0,1])
+                            ax.set_xticklabels([0,1]); ax.set_yticklabels([0,1])
+                            ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+                            for i in range(cm.shape[0]):
+                                for j in range(cm.shape[1]):
+                                    ax.text(j, i, cm[i,j], ha='center', va='center', color='white' if cm[i,j] > cm.max()/2 else 'black', fontsize=14)
+                            st.pyplot(fig)
+
+                            # ROC curve
+                            fpr, tpr, _ = roc_curve(y_true, ensemble_probs_val)
+                            fig2, ax2 = plt.subplots(figsize=(5,4))
+                            ax2.plot(fpr, tpr, label=f"AUC={roc_auc:.4f}")
+                            ax2.plot([0,1],[0,1],'k--')
+                            ax2.set_xlabel("FPR"); ax2.set_ylabel("TPR"); ax2.legend(loc='lower right')
+                            st.pyplot(fig2)
+            except Exception as e:
+                st.error(f"Evaluation failed: {e}")
+
+        # Save ensemble predictions to CSV if requested
+        if download_predictions:
+            try:
+                out = X_engineered.copy()
+                out['ensemble_prob'] = ensemble_prob
+                out['ensemble_pred'] = ensemble_pred
+                out.to_csv("ensemble_prediction_latest.csv", index=False)
+                st.success("Saved ensemble_prediction_latest.csv")
+            except Exception as e:
+                st.warning(f"Could not save CSV: {e}")
+
+# ------------------------
+# Footer and tips
+# ------------------------
+st.markdown("---")
+st.markdown(
+    """
+    **Notes & tips**
+    - This app uses *soft voting* (weighted average of model probabilities).  
+    - Weights come from the leaderboard (ROC-AUC). You can adjust them in code if you want a different weighting scheme.
+    - If some models are missing or fail to load they will be skipped (app will continue).
+    - To deploy: `streamlit run bankrup.py` on your local machine or deploy to Streamlit Cloud / any server.
+    """
+)
+
